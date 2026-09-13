@@ -42,11 +42,19 @@ from .metrics import (
     total_variation,
     unseen_share,
 )
-from .schema import SchemaReport, WINDOW_SCOPE, check_schema
+from .schema import WINDOW_SCOPE, SchemaReport, check_schema
 from .stats import benjamini_hochberg
 
 GRADED: tuple[str, ...] = ("none", "warn", "alert")
+UNGRADED: tuple[str, ...] = ("skipped", "insufficient_data")
 VERDICTS: tuple[str, ...] = ("stable", "investigate", "action_required")
+SEVERITY_RANK: dict[str, int] = {
+    "alert": 0,
+    "warn": 1,
+    "insufficient_data": 2,
+    "skipped": 3,
+    "none": 4,
+}
 
 
 def psi_noise_floor(n_reference: int, n_current: int, n_bins: int) -> float:
@@ -163,7 +171,7 @@ class FeatureDrift:
     detail: dict = field(default_factory=dict)
 
     @property
-    def flagged(self) -> bool	:
+    def flagged(self) -> bool:
         return self.severity in ("warn", "alert")
 
     def to_dict(self) -> dict:
@@ -173,9 +181,9 @@ class FeatureDrift:
             "rows": self.rows,
             "effect_name": self.effect_name,
             "effect": None if np.isnan(self.effect) else round(self.effect, 5),
-            "warn_threshold": round(self.warn_threshold, 5),
-            "alert_threshold": round(self.alert_threshold, 5),
-            "noise_floor": round(self.noise_floor, 5),
+            "warn_threshold": None if np.isnan(self.warn_threshold) else round(self.warn_threshold, 5),
+            "alert_threshold": None if np.isnan(self.alert_threshold) else round(self.alert_threshold, 5),
+            "noise_floor": None if np.isnan(self.noise_floor) else round(self.noise_floor, 5),
             "statistic": None if np.isnan(self.statistic) else round(self.statistic, 4),
             "p_value": None if self.p_value is None else round(self.p_value, 6),
             "q_value": None if self.q_value is None else round(self.q_value, 6),
@@ -213,11 +221,20 @@ class DriftReport:
         return "stable"
 
     def frame(self) -> pd.DataFrame:
+        """Worst first: alerts, then warnings, then whatever could not be graded."""
+        columns = [
+            "feature",
+            "kind",
+            "rows",
+            "effect_name",
+            "effect",
+            "warn_at",
+            "noise_floor",
+            "q_value",
+            "severity",
+        ]
         if not self.features:
-            return pd.DataFrame(
-                columns=["feature", "kind", "effect_name", "effect", "q_value", "severity"]
-            )
-        order = {"alert": 0, "warn": 1, "insufficient_data": 2, "skipped": 3, "none": 4}
+            return pd.DataFrame({name: pd.Series(dtype="object") for name in columns})
         frame = pd.DataFrame(
             [
                 {
@@ -225,19 +242,30 @@ class DriftReport:
                     "kind": item.kind,
                     "rows": item.rows,
                     "effect_name": item.effect_name,
-                    "effect": None if np.isnan(item.effect) else round(item.effect, 4),
-                    "warn_at": round(item.warn_threshold, 4),
-                    "noise_floor": round(item.noise_floor, 4),
-                    "q_value": None if item.q_value is None else round(item.q_value, 5),
+                    "effect": float(item.effect),
+                    "warn_at": float(item.warn_threshold),
+                    "noise_floor": float(item.noise_floor),
+                    "q_value": float("nan") if item.q_value is None else float(item.q_value),
                     "severity": item.severity,
                 }
                 for item in self.features
-            ]
+            ],
+            columns=columns,
         )
-        return frame.sort_values(
-            ["severity", "effect"],
-            key=lambda column: column.map(order) if column.name == "severity" else -column.fillna(0),
-            ignore_index=True,
+        # an explicit rank column rather than a sort key: when every feature was skipped the
+        # effect column is all-NaN, and a key that negates it would raise on an object dtype
+        frame["_rank"] = frame["severity"].map(SEVERITY_RANK).fillna(9).astype(int)
+        return (
+            frame.sort_values(
+                ["_rank", "effect"],
+                ascending=[True, False],
+                na_position="last",
+                ignore_index=True,
+            )
+            .drop(columns="_rank")
+            .round(
+                {"effect": 4, "warn_at": 4, "noise_floor": 4, "q_value": 5}
+            )
         )
 
     def to_dict(self) -> dict:
@@ -297,8 +325,8 @@ def _numeric_drift(
                 rows=int(clean.size),
                 effect_name="psi",
                 effect=float("nan"),
-                warn_threshold=policy.psi_warn,
-                alert_threshold=policy.psi_alert,
+                warn_threshold=float("nan"),
+                alert_threshold=float("nan"),
                 noise_floor=float("nan"),
                 statistic=float("nan"),
                 p_value=None,
@@ -375,8 +403,8 @@ def _categorical_drift(
                 rows=total,
                 effect_name="tvd",
                 effect=float("nan"),
-                warn_threshold=policy.tvd_warn,
-                alert_threshold=policy.tvd_alert,
+                warn_threshold=float("nan"),
+                alert_threshold=float("nan"),
                 noise_floor=float("nan"),
                 statistic=float("nan"),
                 p_value=None,
@@ -432,7 +460,7 @@ def _skipped(name: str, kind: str, reason: str) -> FeatureDrift:
         feature=name,
         kind=kind,
         rows=0,
-        effect_name="psi" if kind != "categorical" else "tvd",
+        effect_name="tvd" if kind == "categorical" else "psi",
         effect=float("nan"),
         warn_threshold=float("nan"),
         alert_threshold=float("nan"),
@@ -528,12 +556,15 @@ def scan_window(
                 bool(rejected[offset]),
                 policy.require_significance,
             )
-            if draft.kind == "categorical" and draft.detail.get("unseen_share", 0.0) > policy.unseen_warn:
+            unseen = float(draft.detail.get("unseen_share", 0.0))
+            if draft.kind == "categorical" and unseen > policy.unseen_warn:
+                # a level the model has never seen is a coding problem, not a distribution
+                # shift, and it does not need statistical support to be worth a look
                 if severity == "none":
                     severity = "warn"
                 note += (
-                    f"; {draft.detail['unseen_share']:.2%} of rows are in levels the reference "
-                    "never saw, which is escalated on its own"
+                    f"; {unseen:.2%} of rows fall in levels the reference never saw, which is "
+                    "escalated on its own"
                 )
             graded[index] = FeatureDrift(
                 **{
