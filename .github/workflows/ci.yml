@@ -1,0 +1,59 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install -e .
+
+      - name: Test
+        run: pytest -q --durations=10
+
+      - name: Reproduce the detector evaluation
+        # the headline artefact of the repo has to keep running, not just keep compiling
+        run: |
+          python -m driftwatch.cli evaluate --scenario concept \
+            --reference-rows 2000 --window-rows 400 --windows 8 --change-at 4
+          python -m driftwatch.cli replay --scenario sudden_covariate \
+            --reference-rows 2000 --window-rows 400 --windows 8 --change-at 4 --label-lag 2
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the sidecar image
+        run: docker build -t driftwatch:ci .
+      - name: Start it and check the health endpoint
+        run: |
+          docker run -d --name driftwatch -p 8000:8000 driftwatch:ci
+          for attempt in $(seq 1 20); do
+            if curl -fsS http://127.0.0.1:8000/health; then break; fi
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8000/health | grep '"baseline_loaded":false'
+          curl -fsS http://127.0.0.1:8000/decisions | grep 'concept drift'
+          # monitoring nothing must refuse, not answer cheerfully
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8000/summary)" = "409"
+          docker rm -f driftwatch

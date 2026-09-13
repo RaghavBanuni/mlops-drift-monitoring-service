@@ -47,6 +47,12 @@ class TestTailProbabilities:
         assert chi2_sf(0.0, 3) == pytest.approx(1.0)
         assert chi2_sf(1_000.0, 3) < 1e-12
 
+    def test_chi_square_rejects_bad_arguments(self):
+        with pytest.raises(ValueError):
+            chi2_sf(1.0, 0)
+        with pytest.raises(ValueError):
+            chi2_sf(-1.0, 3)
+
     def test_gamma_tail_agrees_with_the_exponential_case(self):
         # Q(1, x) is exactly exp(-x): the series and the continued fraction must both land there
         for x in (0.05, 0.5, 2.0, 12.0, 40.0):
@@ -83,15 +89,23 @@ class TestMultiplicityCorrection:
         assert np.all(qvalues < 1e-5)
 
     def test_uniform_pvalues_stay_almost_entirely_unrejected(self):
-        # the point of the correction: 200 null tests should not produce ten discoveries
+        # the point of the correction: 200 null tests should not produce ten discoveries, which
+        # is what an uncorrected alpha of 0.05 would hand an on-call engineer every single day
         pvalues = np.random.default_rng(3).uniform(size=200)
         rejected, _ = benjamini_hochberg(pvalues, 0.05)
         assert int(rejected.sum()) <= 2
-        assert int(bonferroni(pvalues, 0.05).sum()) == 0
+        assert int(bonferroni(pvalues, 0.05).sum()) <= 1
+        assert int((pvalues <= 0.05).sum()) >= 5  # uncorrected, for contrast
+
+    def test_empty_input_is_handled(self):
+        rejected, qvalues = benjamini_hochberg([], 0.05)
+        assert rejected.size == 0 and qvalues.size == 0
 
     def test_input_validation(self):
         with pytest.raises(ValueError):
             benjamini_hochberg([0.1, 1.4], 0.05)
+        with pytest.raises(ValueError):
+            benjamini_hochberg([0.1, float("nan")], 0.05)
         with pytest.raises(ValueError):
             benjamini_hochberg([0.1, 0.2], 1.5)
 
@@ -103,6 +117,15 @@ class TestBootstrap:
         assert low < sample[:, 0].mean() < high
         assert high - low < 0.5  # 400 rows of unit noise: the interval must be tight
 
+    def test_the_interval_widens_as_the_sample_shrinks(self):
+        rng = np.random.default_rng(4)
+        statistic = lambda draw: float(draw[:, 0].mean())  # noqa: E731
+        big = np.asarray(rng.normal(size=2_000)).reshape(-1, 1)
+        small = big[:100]
+        wide = bootstrap_ci(small, statistic, n_boot=200, seed=1)
+        narrow = bootstrap_ci(big, statistic, n_boot=200, seed=1)
+        assert (wide[1] - wide[0]) > 3 * (narrow[1] - narrow[0])
+
     def test_interval_is_reproducible(self):
         sample = np.random.default_rng(1).normal(size=200).reshape(-1, 1)
         statistic = lambda draw: float(draw[:, 0].mean())  # noqa: E731
@@ -112,7 +135,11 @@ class TestBootstrap:
 
     def test_nan_statistics_do_not_poison_the_interval(self):
         sample = np.arange(50, dtype=float).reshape(-1, 1)
-        low, high = bootstrap_ci(
-            sample, lambda draw: float("nan"), n_boot=50, seed=0
-        )
+        low, high = bootstrap_ci(sample, lambda draw: float("nan"), n_boot=50, seed=0)
         assert np.isnan(low) and np.isnan(high)
+
+    def test_bad_arguments_are_refused(self):
+        with pytest.raises(ValueError):
+            bootstrap_ci(np.array([[1.0]]), lambda draw: 0.0)
+        with pytest.raises(ValueError):
+            bootstrap_ci(np.arange(10.0).reshape(-1, 1), lambda draw: 0.0, level=1.5)

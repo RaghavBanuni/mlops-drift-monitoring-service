@@ -6,14 +6,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from driftwatch.baseline import (
-    OTHER_LABEL,
-    Baseline,
-    fit_baseline,
-    infer_kinds,
-)
+from driftwatch.baseline import OTHER_LABEL, Baseline, fit_baseline, infer_kinds
 from driftwatch.detect import psi_from_shares, scan_window
 from driftwatch.metrics import bin_shares
+
+EPSILON = 1e-4  # the fit-time floor; the comparison has to use the same one
 
 
 class TestFitting:
@@ -38,10 +35,22 @@ class TestFitting:
         with pytest.raises(ValueError, match="both"):
             fit_baseline(frame, numeric=["x"], categorical=["x"])
 
+    def test_a_missing_column_is_named(self):
+        frame = pd.DataFrame({"x": np.random.default_rng(0).normal(size=300)})
+        with pytest.raises(ValueError, match="not present"):
+            fit_baseline(frame, features=["x", "ghost"])
+
     def test_reference_performance_is_recorded_when_outcomes_are_supplied(self, baseline):
         assert baseline.baseline_auc is not None
         assert 0.55 < baseline.baseline_auc < 1.0  # the synthetic model must actually rank
         assert 0.0 < baseline.positive_rate < 1.0
+        assert baseline.prediction is not None
+
+    def test_no_outcomes_means_no_reference_performance(self, stable):
+        baseline = fit_baseline(
+            stable.reference, features=["income", "region"], prediction_column="prediction"
+        )
+        assert baseline.baseline_auc is None
         assert baseline.prediction is not None
 
     def test_features_exclude_the_prediction_and_target(self, baseline):
@@ -76,7 +85,7 @@ class TestStoredShares:
         assert profile.share_array().sum() == pytest.approx(1.0, abs=1e-6)
         assert profile.share_array().max() > 0.5  # unequal, as expected
         assert psi_from_shares(
-            profile.share_array(), bin_shares(values, profile.edge_array())
+            profile.share_array(), bin_shares(values, profile.edge_array(), EPSILON)
         ) == pytest.approx(0.0, abs=1e-9)
 
         uniform = np.full(profile.n_bins, 1.0 / profile.n_bins)
@@ -85,6 +94,7 @@ class TestStoredShares:
     def test_reference_counts_sum_to_the_reference_size(self, baseline):
         profile = baseline.numeric["income"]
         assert profile.reference_counts().sum() == pytest.approx(profile.count, rel=1e-6)
+        assert profile.n_bins == profile.share_array().size
 
 
 class TestCategoricalProfile:
@@ -104,7 +114,11 @@ class TestCategoricalProfile:
     def test_folded_levels_are_not_reported_as_unseen(self):
         rng = np.random.default_rng(3)
         frame = pd.DataFrame(
-            {"key": np.concatenate([rng.choice(["a", "b"], size=800), [f"t{i}" for i in range(200)]])}
+            {
+                "key": np.concatenate(
+                    [rng.choice(["a", "b"], size=800), [f"t{index}" for index in range(200)]]
+                )
+            }
         )
         baseline = fit_baseline(frame, categorical=["key"], min_rows=200, min_category_share=0.02)
         profile = baseline.categorical["key"]
@@ -134,6 +148,13 @@ class TestSerialisation:
         assert restored.edge_array()[0] == -np.inf and restored.edge_array()[-1] == np.inf
         assert restored.share_array() == pytest.approx(original.share_array())
         assert restored.edges == original.edges
+
+    def test_the_serialised_form_carries_no_infinities(self, baseline):
+        # JSON has no infinity, and a monitoring artefact that only Python can read is not an
+        # artefact: the open tails round-trip through null instead
+        payload = baseline.to_dict()["numeric"]["income"]
+        assert payload["edges"][0] is None and payload["edges"][-1] is None
+        assert all(isinstance(edge, float) for edge in payload["edges"][1:-1])
 
     def test_a_reloaded_baseline_still_scores_its_own_reference_as_stable(
         self, baseline, stable, tmp_path

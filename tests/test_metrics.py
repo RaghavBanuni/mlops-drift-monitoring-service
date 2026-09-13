@@ -58,6 +58,10 @@ class TestBinning:
         assert np.all(np.diff(edges) > 0)
         assert len(edges) < 11
 
+    def test_too_few_bins_is_refused(self, reference):
+        with pytest.raises(ValueError):
+            quantile_bin_edges(reference, 1)
+
     def test_counts_and_shares_agree(self, reference):
         edges = quantile_bin_edges(reference, 8)
         counts = bin_counts(reference, edges)
@@ -84,10 +88,14 @@ class TestPSI:
     def test_psi_table_decomposes_the_total(self, reference):
         current = reference * 1.3 + 0.4
         table = psi_table(reference, current, n_bins=10)
-        assert table["contribution"].sum() == pytest.approx(psi(reference, current, n_bins=10), rel=1e-9)
-        assert table["reference_share"].sum() == pytest.approx(1.0, abs=1e-6)
+        # the table is rounded for reading, so it reconstructs the total to rounding only
+        assert table["contribution"].sum() == pytest.approx(
+            psi(reference, current, n_bins=10), abs=2e-4
+        )
+        assert table["reference_share"].sum() == pytest.approx(1.0, abs=1e-4)
         # sorted worst-first so a human sees which part of the range moved
         assert table["contribution"].is_monotonic_decreasing
+        assert len(table) == 10
 
     def test_psi_is_symmetric(self, reference):
         current = reference + 0.6
@@ -132,7 +140,13 @@ class TestDistances:
         disjoint = jensen_shannon(np.array([1.0, 0.0]), np.array([0.0, 1.0]))
         assert 0 == pytest.approx(jensen_shannon(p, p), abs=1e-12)
         assert 0 < near < far < disjoint <= 1.0 + 1e-9
-        assert disjoint >= 0.69  # log2 gives 1 bit, natural log 0.693: both are the maximum
+        assert disjoint >= 0.69  # one bit in log2, ln(2) in nats: either way, the maximum
+
+    def test_mismatched_supports_are_refused(self):
+        with pytest.raises(ValueError):
+            total_variation(np.array([0.5, 0.5]), np.array([0.3, 0.3, 0.4]))
+        with pytest.raises(ValueError):
+            jensen_shannon(np.array([0.0, 0.0]), np.array([0.5, 0.5]))
 
 
 class TestCategorical:
@@ -146,6 +160,10 @@ class TestCategorical:
     def test_nulls_are_a_category_when_the_reference_knew_them(self):
         counts = categorical_counts(["a", None, None], ["a", NULL_LABEL])
         assert counts.tolist() == [1, 2, 0]
+
+    def test_an_empty_vocabulary_is_refused(self):
+        with pytest.raises(ValueError):
+            categorical_counts(["a"], [])
 
     def test_chi_square_does_not_flag_identical_distributions(self):
         counts = np.array([300, 250, 200, 150, 100])
@@ -168,6 +186,10 @@ class TestCategorical:
         _statistic, _p, dof, pooled = chi_square_homogeneity(reference, current, min_expected=5.0)
         assert pooled >= 2
         assert dof < 4
+
+    def test_mismatched_count_vectors_are_refused(self):
+        with pytest.raises(ValueError):
+            chi_square_homogeneity(np.array([1.0, 2.0]), np.array([1, 2, 3]))
 
     def test_cramers_v_is_a_bounded_effect_size(self):
         assert cramers_v(0.0, 500, 3) == pytest.approx(0.0)
